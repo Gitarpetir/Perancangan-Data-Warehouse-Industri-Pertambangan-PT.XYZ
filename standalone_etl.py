@@ -7,9 +7,12 @@ This script runs the complete ETL pipeline without Airflow dependencies
 import pandas as pd
 import pymssql
 import logging
-import logging
 import time
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Configure logging
 logging.basicConfig(
@@ -21,21 +24,27 @@ logging.basicConfig(
     ]
 )
 
+
 def get_sql_connection():
-    """Create SQL Server connection"""
-    try:
-        conn = pymssql.connect(
-            server='localhost',
-            port=1433,
-            database='PTXYZ_DataWarehouse',
-            user='sa',
-            password='PTXYZSecure123!',
-            timeout=30
+    """Connect to the PT XYZ Data Warehouse."""
+
+    sql_password = os.getenv("MSSQL_SA_PASSWORD")
+
+    if not sql_password:
+        raise RuntimeError(
+            "MSSQL_SA_PASSWORD tidak ditemukan. "
+            "Periksa file .env."
         )
-        return conn
-    except Exception as e:
-        logging.error(f"Error connecting to SQL Server: {str(e)}")
-        raise
+
+    return pymssql.connect(
+        server="localhost",
+        port=1434,
+        database="PTXYZ_DataWarehouse",
+        user="sa",
+        password=sql_password,
+        timeout=30,
+        login_timeout=10
+    )
 
 def extract_and_load_to_staging():
     """Extract data from CSV files and load to staging tables"""
@@ -51,7 +60,7 @@ def extract_and_load_to_staging():
         
         # Load Equipment Usage data
         logging.info("Loading Equipment Usage data...")
-        equipment_df = pd.read_csv('data/raw/Dataset/dataset_alat_berat_dw.csv')
+        equipment_df = pd.read_csv('data/dataset_alat_berat_dw.csv')
         equipment_df['purchase_date'] = pd.to_datetime(equipment_df['purchase_date']).dt.date
         equipment_df['date'] = pd.to_datetime(equipment_df['date']).dt.date
         equipment_df['created_at'] = pd.to_datetime(equipment_df['created_at'])
@@ -75,7 +84,7 @@ def extract_and_load_to_staging():
         
         # Load Production data
         logging.info("Loading Production data...")
-        production_df = pd.read_csv('data/raw/Dataset/dataset_production.csv')
+        production_df = pd.read_csv('data/dataset_production.csv')
         production_df['date'] = pd.to_datetime(production_df['date']).dt.date
         production_df['hire_date'] = pd.to_datetime(production_df['hire_date']).dt.date
         
@@ -98,7 +107,7 @@ def extract_and_load_to_staging():
         
         # Load Financial Transaction data
         logging.info("Loading Financial Transaction data...")
-        transaction_df = pd.read_csv('data/raw/Dataset/dataset_transaksi.csv')
+        transaction_df = pd.read_csv('data/dataset_transaksi.csv')
         transaction_df['created_at'] = pd.to_datetime(transaction_df['created_at'])
         transaction_df['date'] = pd.to_datetime(transaction_df['date'], format='%Y%m%d').dt.date
         transaction_df['start_date'] = pd.to_datetime(transaction_df['start_date']).dt.date
@@ -281,15 +290,65 @@ def transform_and_load_dimensions():
         raise
 
 def load_fact_tables():
-    """Load fact tables from staging data"""
+    """Full-refresh fact loading with transaction, locking, and validation.
+
+    The three fact tables are rebuilt from staging in one transaction.
+    Dimension and staging tables are not modified by this function.
+    """
+    conn = None
+    cursor = None
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
-        
+        conn.autocommit(False)
+
+        logging.info("Starting validated fact-table refresh...")
+
+        # Ensure two executions of this corrected loader do not run together.
+        cursor.execute("""
+            DECLARE @result INT;
+            EXEC @result = sp_getapplock
+                @Resource = 'PTXYZ_Fact_Load',
+                @LockMode = 'Exclusive',
+                @LockOwner = 'Transaction',
+                @LockTimeout = 30000;
+            SELECT @result;
+        """)
+        lock_result = cursor.fetchone()[0]
+        if lock_result < 0:
+            raise RuntimeError(
+                f"Tidak bisa memperoleh lock ETL (kode {lock_result}). "
+                "Kemungkinan proses ETL lain sedang berjalan."
+            )
+
+        # Acquire exclusive table locks, held until commit/rollback. This also
+        # prevents concurrent writers from modifying these fact tables mid-load.
+        fact_tables = [
+            "fact.FactEquipmentUsage",
+            "fact.FactProduction",
+            "fact.FactFinancialTransaction",
+        ]
+        for table in fact_tables:
+            cursor.execute(f"SELECT COUNT(*) FROM {table} WITH (TABLOCKX, HOLDLOCK)")
+            cursor.fetchone()
+
+        # This is a controlled full refresh of fact rows only.
+        for table in fact_tables:
+            cursor.execute(f"DELETE FROM {table}")
+
+        expected_counts = {}
+        for table, source in [
+            ("fact.FactEquipmentUsage", "staging.EquipmentUsage"),
+            ("fact.FactProduction", "staging.Production"),
+            ("fact.FactFinancialTransaction", "staging.FinancialTransaction"),
+        ]:
+            cursor.execute(f"SELECT COUNT(*) FROM {source}")
+            expected_counts[table] = cursor.fetchone()[0]
+
         logging.info("Loading FactEquipmentUsage...")
         cursor.execute("""
             INSERT INTO fact.FactEquipmentUsage (
-                equipment_usage_id, time_key, site_key, equipment_key, 
+                equipment_usage_id, time_key, site_key, equipment_key,
                 operating_hours, downtime_hours, fuel_consumption, maintenance_cost
             )
             SELECT DISTINCT
@@ -302,15 +361,24 @@ def load_fact_tables():
                 e.fuel_consumption,
                 e.maintenance_cost
             FROM staging.EquipmentUsage e
-            JOIN dim.DimTime t ON e.time_id = t.time_id
-            JOIN dim.DimSite s ON e.site_name = s.site_name
+            JOIN dim.DimTime t ON e.[date] = t.[date]
+            JOIN dim.DimSite s
+              ON e.site_name = s.site_name
+             AND e.region = s.region
+             AND (e.latitude = s.latitude OR (e.latitude IS NULL AND s.latitude IS NULL))
+             AND (e.longitude = s.longitude OR (e.longitude IS NULL AND s.longitude IS NULL))
+             AND s.site_id < 0
             JOIN dim.DimEquipment eq ON e.equipment_name = eq.equipment_name
-            WHERE NOT EXISTS (
-                SELECT 1 FROM fact.FactEquipmentUsage f 
-                WHERE f.equipment_usage_id = e.equipment_usage_id
-            )
         """)
-        
+        inserted = cursor.rowcount
+        logging.info("FactEquipmentUsage inserted rows: %s", inserted)
+        if inserted != expected_counts["fact.FactEquipmentUsage"]:
+            raise RuntimeError(
+                "FactEquipmentUsage: jumlah hasil INSERT "
+                f"{inserted}, tetapi staging berisi {expected_counts['fact.FactEquipmentUsage']}. "
+                "Transaksi dibatalkan."
+            )
+
         logging.info("Loading FactProduction...")
         cursor.execute("""
             INSERT INTO fact.FactProduction (
@@ -328,17 +396,26 @@ def load_fact_tables():
                 p.unit_cost,
                 p.quantity
             FROM staging.Production p
-            JOIN dim.DimTime t ON p.time_id = t.time_id
-            JOIN dim.DimSite s ON p.site_name = s.site_name
+            JOIN dim.DimTime t ON p.[date] = t.[date]
+            JOIN dim.DimSite s
+              ON p.site_id = s.site_id
+             AND p.site_name = s.site_name
+             AND p.region = s.region
+             AND (p.latitude = s.latitude OR (p.latitude IS NULL AND s.latitude IS NULL))
+             AND (p.longitude = s.longitude OR (p.longitude IS NULL AND s.longitude IS NULL))
             JOIN dim.DimMaterial m ON p.material_id = m.material_id
             JOIN dim.DimEmployee e ON p.employee_id = e.employee_id
             JOIN dim.DimShift sh ON p.shift_id = sh.shift_id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM fact.FactProduction f 
-                WHERE f.production_id = p.production_id
-            )
         """)
-        
+        inserted = cursor.rowcount
+        logging.info("FactProduction inserted rows: %s", inserted)
+        if inserted != expected_counts["fact.FactProduction"]:
+            raise RuntimeError(
+                "FactProduction: jumlah hasil INSERT "
+                f"{inserted}, tetapi staging berisi {expected_counts['fact.FactProduction']}. "
+                "Transaksi dibatalkan."
+            )
+
         logging.info("Loading FactFinancialTransaction...")
         cursor.execute("""
             INSERT INTO fact.FactFinancialTransaction (
@@ -346,7 +423,7 @@ def load_fact_tables():
                 budgeted_cost, actual_cost, account_cost
             )
             SELECT DISTINCT
-                f.id as transaction_id,
+                f.id AS transaction_id,
                 t.time_key,
                 s.site_key,
                 p.project_key,
@@ -355,25 +432,59 @@ def load_fact_tables():
                 f.actual_cost,
                 f.cost
             FROM staging.FinancialTransaction f
-            JOIN dim.DimTime t ON f.time_id = t.time_id
-            JOIN dim.DimSite s ON f.site_name = s.site_name
+            JOIN dim.DimTime t ON f.[date] = t.[date]
+            JOIN dim.DimSite s
+              ON f.site_id = s.site_id
+             AND f.site_name = s.site_name
+             AND f.region = s.region
+             AND (f.latitude = s.latitude OR (f.latitude IS NULL AND s.latitude IS NULL))
+             AND (f.longitude = s.longitude OR (f.longitude IS NULL AND s.longitude IS NULL))
             JOIN dim.DimProject p ON f.project_id = p.project_id
             JOIN dim.DimAccount a ON f.account_id = a.account_id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM fact.FactFinancialTransaction ft 
-                WHERE ft.transaction_id = f.id
-            )
         """)
-        
+        inserted = cursor.rowcount
+        logging.info("FactFinancialTransaction inserted rows: %s", inserted)
+        if inserted != expected_counts["fact.FactFinancialTransaction"]:
+            raise RuntimeError(
+                "FactFinancialTransaction: jumlah hasil INSERT "
+                f"{inserted}, tetapi staging berisi {expected_counts['fact.FactFinancialTransaction']}. "
+                "Transaksi dibatalkan."
+            )
+
+        # Validate final counts and unique source IDs before committing.
+        id_columns = {
+            "fact.FactEquipmentUsage": "equipment_usage_id",
+            "fact.FactProduction": "production_id",
+            "fact.FactFinancialTransaction": "transaction_id",
+        }
+        for table in fact_tables:
+            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            total = cursor.fetchone()[0]
+            id_column = id_columns[table]
+            cursor.execute(f"SELECT COUNT(DISTINCT {id_column}) FROM {table}")
+            unique_ids = cursor.fetchone()[0]
+            expected = expected_counts[table]
+            logging.info("%s: total=%s, unique IDs=%s, expected=%s", table, total, unique_ids, expected)
+            if total != expected or unique_ids != expected:
+                raise RuntimeError(
+                    f"Validasi gagal pada {table}: total={total}, "
+                    f"ID unik={unique_ids}, target={expected}. Transaksi dibatalkan."
+                )
+
         conn.commit()
-        conn.close()
-        
-        logging.info("Fact tables loaded successfully")
-        return "Fact load completed"
-        
+        logging.info("All fact tables refreshed and validated successfully.")
+        return "Fact load completed; all counts validated"
+
     except Exception as e:
-        logging.error(f"Error loading fact tables: {str(e)}")
+        if conn is not None:
+            conn.rollback()
+        logging.error("Error loading fact tables; transaction rolled back: %s", str(e))
         raise
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 def data_quality_check():
     """Perform data quality checks"""
@@ -418,41 +529,41 @@ def data_quality_check():
 def run_complete_etl():
     """Execute the complete ETL pipeline"""
     try:
-        logging.info("🚀 Starting PT XYZ Complete ETL Pipeline...")
+        logging.info("ðŸš€ Starting PT XYZ Complete ETL Pipeline...")
         
         # Step 1: Extract and Load to Staging
-        logging.info("📥 Step 1: Extracting and loading data to staging tables...")
+        logging.info("ðŸ“¥ Step 1: Extracting and loading data to staging tables...")
         result1 = extract_and_load_to_staging()
-        logging.info(f"✅ Step 1 completed: {result1}")
+        logging.info(f"âœ… Step 1 completed: {result1}")
         
         time.sleep(2)  # Brief pause between steps
         
         # Step 2: Transform and Load Dimensions
-        logging.info("🔄 Step 2: Transforming and loading dimension tables...")
+        logging.info("ðŸ”„ Step 2: Transforming and loading dimension tables...")
         result2 = transform_and_load_dimensions()
-        logging.info(f"✅ Step 2 completed: {result2}")
+        logging.info(f"âœ… Step 2 completed: {result2}")
         
         time.sleep(2)
         
         # Step 3: Load Fact Tables
-        logging.info("📊 Step 3: Loading fact tables...")
+        logging.info("ðŸ“Š Step 3: Loading fact tables...")
         result3 = load_fact_tables()
-        logging.info(f"✅ Step 3 completed: {result3}")
+        logging.info(f"âœ… Step 3 completed: {result3}")
         
         time.sleep(2)
         
         # Step 4: Data Quality Check
-        logging.info("🔍 Step 4: Running data quality checks...")
+        logging.info("ðŸ” Step 4: Running data quality checks...")
         result4 = data_quality_check()
-        logging.info(f"✅ Step 4 completed: {result4}")
+        logging.info(f"âœ… Step 4 completed: {result4}")
         
-        logging.info("🎉 Complete ETL Pipeline Successfully Executed!")
-        logging.info("📈 Data Warehouse is now ready for analytics and visualization!")
+        logging.info("ðŸŽ‰ Complete ETL Pipeline Successfully Executed!")
+        logging.info("ðŸ“ˆ Data Warehouse is now ready for analytics and visualization!")
         
         return True
         
     except Exception as e:
-        logging.error(f"❌ ETL Pipeline failed: {str(e)}")
+        logging.error(f"âŒ ETL Pipeline failed: {str(e)}")
         return False
 
 if __name__ == "__main__":
@@ -463,12 +574,13 @@ if __name__ == "__main__":
     success = run_complete_etl()
     
     if success:
-        logging.info("✅ ETL Pipeline completed successfully!")
-        logging.info("🌐 You can now access:")
+        logging.info("âœ… ETL Pipeline completed successfully!")
+        logging.info("ðŸŒ You can now access:")
         logging.info("   - Airflow UI: http://localhost:8080")
         logging.info("   - Grafana: http://localhost:3000")
         logging.info("   - Superset: http://localhost:8088")
         logging.info("   - Metabase: http://localhost:3001")
         logging.info("   - Jupyter: http://localhost:8888")
     else:
-        logging.error("❌ ETL Pipeline failed!")
+        logging.error("âŒ ETL Pipeline failed!")
+
